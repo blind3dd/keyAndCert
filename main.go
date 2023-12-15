@@ -183,33 +183,3 @@ func main() {
 		}
 	}
 }
-
-//func getCert(ctx context.Context) error {
-//	output := make(chan struct{})
-//	defer close(out)
-//
-//}
-
-// key generation
-
-// csr from the key
-
-// openssslcnfv3
-
-// cert from the csr
-
-// proxy cert out of the cert I had on my machine to somebody's fucking something through idms?
-
-// can you sign the self-signed?:-)
-//func SeedInit() {
-//	mrand.New(mrand.NewSource(int64(new(maphash.Hash).Sum64())))
-//}
-//
-//func SeedInit() {
-//	//mrand.New(mrand.NewSource(int64(seed))).Seed(int64(seed))
-//	//SeedInit()
-//	//d := time.Since(time.Now())
-//	//mrand.Rand{}.Int()
-//	//
-//	//return int64(d)
-//}
