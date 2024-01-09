@@ -15,7 +15,6 @@ import (
 	mrand "math/rand"
 	"net"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -79,7 +78,7 @@ func (s *seed) GenerateCertTemplate(ctx context.Context) (
 	error,
 	*x509.Certificate,
 ) {
-	log.Println("running goroutine to generate cert from private key")
+	log.Println("running goroutine to generate cert")
 	sn, ok := ctx.Value(s.Key).(*big.Int)
 	if !ok {
 		log.Fatalf("failed to type assert the variable type: %v", sn)
@@ -197,8 +196,6 @@ func main() {
 	var key, _ = s.transformToInt(uid7)
 
 	ctx = context.WithValue(ctx, key, sn)
-	wg := &sync.WaitGroup{}
-	wg.Add(2)
 
 	go func(ctx context.Context) {
 		for {
@@ -208,18 +205,15 @@ func main() {
 					log.Printf("failed to generate cert template, error: %v", err)
 				}
 				log.Println("finished generating cert from template")
-				wg.Done()
-				return
+
 			default:
 				if err, _ := s.GenerateCertTemplate(ctx); err != nil {
 					log.Fatalf("failed to generate cert template, error: %v", err)
 				}
 			}
-			wg.Wait()
 		}
 	}(ctx)
-	defer wg.Done()
-	wg.Add(1)
+
 	ticker := time.NewTicker(500 * time.Millisecond)
 
 	for {
