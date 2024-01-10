@@ -8,13 +8,13 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/pem"
-	"errors"
 	"fmt"
 	"log"
 	"math/big"
 	mrand "math/rand"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,6 +23,7 @@ import (
 type seed struct {
 	seeder seeder
 	Key    uint64
+	keyPK  uint64
 }
 
 type seeder interface {
@@ -75,10 +76,9 @@ func (s *seed) GetSerialNumber() uint64 {
 }
 
 func (s *seed) GenerateCertTemplate(ctx context.Context) (
-	error,
 	*x509.Certificate,
+	error,
 ) {
-	log.Println("running goroutine to generate cert")
 	sn, ok := ctx.Value(s.Key).(*big.Int)
 	if !ok {
 		log.Fatalf("failed to type assert the variable type: %v", sn)
@@ -87,8 +87,8 @@ func (s *seed) GenerateCertTemplate(ctx context.Context) (
 		SerialNumber: sn,
 		Subject: pkix.Name{
 			CommonName:   "com.apple.idms.appleid.test",
-			Organization: []string{""},
-			Country:      []string{""},
+			Organization: []string{"Pawel Bek"},
+			Country:      []string{"US,EU"},
 		},
 		NotBefore: time.Now(),
 		NotAfter:  time.Now().AddDate(1, 0, 0),
@@ -100,93 +100,126 @@ func (s *seed) GenerateCertTemplate(ctx context.Context) (
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign | x509.KeyUsageKeyEncipherment | x509.KeyUsageKeyAgreement,
 		BasicConstraintsValid: ok,
 		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
-		EmailAddresses:        []string{"", ""},
+		EmailAddresses:        []string{"test@gmail.com"},
+		DNSNames:              []string{"localhost"},
 	}
-	privKey, err := rsa.GenerateKey(rand.Reader, 4096)
-	if err != nil {
-		log.Fatalf("failed to generate private key, error: %v", err)
-	}
-	go generatePrivateKey(ctx, privKey)
 
-	certBytes, err := x509.CreateCertificate(rand.Reader, &x509t, &x509t, &privKey.PublicKey, privKey)
-	if err != nil {
-		log.Fatalf("failed to create cert, error: %v", err)
-	}
-	go generateCert(ctx, certBytes)
-
-	return nil, &x509t
+	return &x509t, nil
 }
 
 func generatePrivateKey(
 	ctx context.Context,
 	pkey *rsa.PrivateKey,
-) {
-	select {
-	case <-ctx.Done():
-		if err := ctx.Err(); err != nil || errors.Is(err, context.Canceled) {
-			log.Printf("failed to generate key, error: %v", err)
-		}
+) (string, error) {
 
-	default:
-		pemBytes := pem.EncodeToMemory(&pem.Block{
-			Type:  "RSA PRIVATE KEY",
-			Bytes: x509.MarshalPKCS1PrivateKey(pkey),
-		})
-		f, err := os.Create("key.pem")
+	ctxtd := context.WithValue(ctx, 123213, pkey)
+	privKey, ok := ctxtd.Value(123213).(*rsa.PrivateKey)
+	if !ok {
+		log.Fatalf("failed to type assert the variable type: %v", privKey)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(privKey),
+	})
+	if err := writeFile("key.pem", pemBytes); err != nil {
+		log.Fatalf("failed to write key to a file, error: %v", err)
+	}
+
+	return string(pemBytes), nil
+}
+
+func writeFile(fname string, pemb []byte) error {
+	fileMutex.Lock()
+	defer fileMutex.Unlock()
+	f, _ := os.Create(fname)
+	defer func(f *os.File) {
+		err := f.Close()
 		if err != nil {
-			log.Fatal(err)
-		}
-		defer func(f *os.File) {
-			err := f.Close()
-			if err != nil {
-				panic(err)
-			}
-		}(f)
-		if _, err := f.Write(pemBytes); err != nil {
 			panic(err)
 		}
-
-		log.Printf("key generated:\n %s", fmt.Sprint(string(pemBytes)))
+	}(f)
+	if _, err := f.Write(pemb); err != nil {
+		panic(err)
 	}
+
+	return nil
 }
 
 func generateCert(
 	ctx context.Context,
 	certBytes []byte,
-) {
-	select {
-	case <-ctx.Done():
-		if err := ctx.Err(); err != nil || errors.Is(err, context.Canceled) {
-			log.Printf("failed to generate cert, error: %v", err)
-		}
+) (string, error) {
+	pemBytes := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: certBytes,
+	})
+	if err := writeFile("cert.pem", pemBytes); err != nil {
+		log.Fatalf("failed to write cert to a file, error: %v", err)
+	}
+	return string(pemBytes), nil
+}
 
-	default:
-		pemBytes := pem.EncodeToMemory(&pem.Block{
-			Type:  "CERTIFICATE",
-			Bytes: certBytes,
-		})
-		f, err := os.Create("cert.pem")
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer func(f *os.File) {
-			err := f.Close()
-			if err != nil {
-				panic(err)
+func dispatch(ctx context.Context, x509t *x509.Certificate) {
+	privKey, _ := rsa.GenerateKey(rand.Reader, 4096)
+	certBytes, _ := x509.CreateCertificate(rand.Reader, x509t, x509t, &privKey.PublicKey, privKey)
+	privKeyChan := make(chan string, 1)
+	errChan := make(chan error, 1)
+	close(privKeyChan)
+	go func(ctx context.Context) error {
+		log.Println("generating a private key")
+		pkey, _ := generatePrivateKey(ctx, privKey)
+		defer func(ctx context.Context) {
+			if r := recover(); r != nil {
+				err := fmt.Errorf("recovered: %s %s", r.(error).Error(), pkey)
+				errChan <- err
 			}
-		}(f)
-		if _, err := f.Write(pemBytes); err != nil {
-			panic(err)
-		}
+		}(ctx)
 
-		log.Printf("cert generated:\n %s", fmt.Sprint(string(pemBytes)))
-		os.Exit(0)
+		select {
+		case <-ctx.Done():
+			log.Printf("private key: %s", pkey)
+			return <-errChan
+		case <-time.After(1 * time.Millisecond):
+			log.Printf("private key: %s", pkey)
+			return <-errChan
+		case privKeyChan <- pkey:
+			log.Printf("private key: %s", pkey)
+			return <-errChan
+		}
+	}(ctx)
+	log.Println(<-errChan)
+
+	certChan := make(chan string, 1)
+	errorChan := make(chan error, 1)
+	go func() {
+		log.Println("generating a cert file")
+		err := func(ctx context.Context) error {
+			cert, err := generateCert(ctx, certBytes)
+			if err != nil {
+
+				errorChan <- err
+				return <-errorChan
+			}
+			certChan <- cert
+
+			return nil
+		}(ctx)
+		if err != nil {
+			log.Printf("error: %v", err.Error())
+		}
+	}()
+
+	select {
+	case cc := <-certChan:
+		log.Printf("cert file: %s", cc)
+	case <-ctx.Done():
+		log.Printf("context error: %v", ctx.Err())
+	case err := <-errorChan:
+		log.Printf("error: %v", err.Error())
 	}
 }
 
 func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	log.Println("program is starting")
 	s := &seed{}
 	time.Sleep(500 * time.Millisecond)
@@ -194,33 +227,29 @@ func main() {
 
 	uid7 := s.GetUUIDv7()
 	var key, _ = s.transformToInt(uid7)
-
+	ctx := context.Background()
 	ctx = context.WithValue(ctx, key, sn)
+	log.Println("running goroutines to generate key and cert")
+
+	errChan := make(chan error, 1)
+	templChan := make(chan x509.Certificate, 1)
 
 	go func(ctx context.Context) {
-		for {
-			select {
-			case <-ctx.Done():
-				if err := ctx.Err(); err != nil || errors.Is(err, context.Canceled) {
-					log.Printf("failed to generate cert template, error: %v", err)
-				}
-				log.Println("finished generating cert from template")
-
-			default:
-				if err, _ := s.GenerateCertTemplate(ctx); err != nil {
-					log.Fatalf("failed to generate cert template, error: %v", err)
-				}
-			}
+		x509t, err := s.GenerateCertTemplate(ctx)
+		if err != nil {
+			errChan <- err
 		}
+		templChan <- *x509t
 	}(ctx)
-
-	ticker := time.NewTicker(500 * time.Millisecond)
-
-	for {
-		select {
-		case <-ticker.C:
-		case <-ctx.Done():
-		default:
-		}
+	select {
+	case tc := <-templChan:
+		log.Println("generating template for a cert")
+		dispatch(ctx, &tc)
+	case err := <-errChan:
+		log.Printf("error: %v", err.Error())
 	}
 }
+
+var (
+	fileMutex sync.Mutex
+)
