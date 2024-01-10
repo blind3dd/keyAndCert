@@ -8,13 +8,13 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/pem"
-	"errors"
 	"fmt"
 	"log"
 	"math/big"
 	mrand "math/rand"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,6 +23,7 @@ import (
 type seed struct {
 	seeder seeder
 	Key    uint64
+	keyPK  uint64
 }
 
 type seeder interface {
@@ -109,102 +110,116 @@ func (s *seed) GenerateCertTemplate(ctx context.Context) (
 func generatePrivateKey(
 	ctx context.Context,
 	pkey *rsa.PrivateKey,
-) {
-	ctxd, cancel := context.WithTimeout(ctx, duration)
-	defer cancel()
-	select {
+) (string, error) {
 
-	case <-ctxd.Done():
-		if err := ctx.Err(); errors.Is(err, context.Canceled) {
-			log.Printf("failed to generate private key, error: %v", err)
-		}
-
-		pemBytes := pem.EncodeToMemory(&pem.Block{
-			Type:  "RSA PRIVATE KEY",
-			Bytes: x509.MarshalPKCS1PrivateKey(pkey),
-		})
-		f, err := os.Create("key.pem")
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer func(f *os.File) {
-			err := f.Close()
-			if err != nil {
-				panic(err)
-			}
-		}(f)
-		if _, err := f.Write(pemBytes); err != nil {
-			panic(err)
-		}
-
-		log.Printf("key generated:\n %s", fmt.Sprint(string(pemBytes)))
-		//default:
+	ctxtd := context.WithValue(ctx, 123213, pkey)
+	privKey, ok := ctxtd.Value(123213).(*rsa.PrivateKey)
+	if !ok {
+		log.Fatalf("failed to type assert the variable type: %v", privKey)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(privKey),
+	})
+	if err := writeFile("key.pem", pemBytes); err != nil {
+		log.Fatalf("failed to write key to a file, error: %v", err)
 	}
 
+	return string(pemBytes), nil
+}
+
+func writeFile(fname string, pemb []byte) error {
+	fileMutex.Lock()
+	defer fileMutex.Unlock()
+	f, _ := os.Create(fname)
+	defer func(f *os.File) {
+		err := f.Close()
+		if err != nil {
+			panic(err)
+		}
+	}(f)
+	if _, err := f.Write(pemb); err != nil {
+		panic(err)
+	}
+
+	return nil
 }
 
 func generateCert(
 	ctx context.Context,
 	certBytes []byte,
-) {
-	ctxe, cancel := context.WithTimeout(ctx, duration)
-	defer cancel()
-	select {
-	case <-ctxe.Done():
-		if err := ctx.Err(); errors.Is(err, context.Canceled) {
-			log.Printf("failed to generate cert, error: %v", err)
-		}
-		pemBytes := pem.EncodeToMemory(&pem.Block{
-			Type:  "CERTIFICATE",
-			Bytes: certBytes,
-		})
-		f, err := os.Create("cert.pem")
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer func(f *os.File) {
-			err := f.Close()
-			if err != nil {
-				panic(err)
-			}
-		}(f)
-		if _, err := f.Write(pemBytes); err != nil {
-			panic(err)
-		}
-
-		log.Printf("cert generated:\n %s", fmt.Sprint(string(pemBytes)))
-		os.Exit(0)
-		//default:
+) (string, error) {
+	pemBytes := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: certBytes,
+	})
+	if err := writeFile("cert.pem", pemBytes); err != nil {
+		log.Fatalf("failed to write cert to a file, error: %v", err)
 	}
+	return string(pemBytes), nil
 }
 
-func (s *seed) contextRun(ctx context.Context) {
-	x509t, _ := s.GenerateCertTemplate(ctx)
-	ticker := time.NewTicker(duration)
+func dispatch(ctx context.Context, x509t *x509.Certificate) {
 	privKey, _ := rsa.GenerateKey(rand.Reader, 4096)
 	certBytes, _ := x509.CreateCertificate(rand.Reader, x509t, x509t, &privKey.PublicKey, privKey)
+	privKeyChan := make(chan string, 1)
+	errChan := make(chan error, 1)
+	close(privKeyChan)
+	go func(ctx context.Context) error {
+		log.Println("generating a private key")
+		pkey, _ := generatePrivateKey(ctx, privKey)
+		defer func(ctx context.Context) {
+			if r := recover(); r != nil {
+				err := fmt.Errorf("recovered: %s %s", r.(error).Error(), pkey)
+				errChan <- err
+			}
+		}(ctx)
 
-	ctxa, cancel := context.WithTimeout(ctx, duration)
-	ctxb, _ := context.WithTimeout(ctxa, duration)
-	defer cancel()
-	for {
 		select {
-		case <-ticker.C:
-			go generatePrivateKey(ctx, privKey)
-			<-ctxa.Done()
-			break
-		case <-ctxb.Done():
-			go generateCert(ctx, certBytes)
-			<-ctxa.Done()
-			break
-			//ticker.Stop()
-		default:
+		case <-ctx.Done():
+			log.Printf("private key: %s", pkey)
+			return <-errChan
+		case <-time.After(1 * time.Millisecond):
+			log.Printf("private key: %s", pkey)
+			return <-errChan
+		case privKeyChan <- pkey:
+			log.Printf("private key: %s", pkey)
+			return <-errChan
 		}
+	}(ctx)
+	log.Println(<-errChan)
+
+	certChan := make(chan string, 1)
+	errorChan := make(chan error, 1)
+	go func() {
+		log.Println("generating a cert file")
+		err := func(ctx context.Context) error {
+			cert, err := generateCert(ctx, certBytes)
+			if err != nil {
+
+				errorChan <- err
+				return <-errorChan
+			}
+			certChan <- cert
+
+			return nil
+		}(ctx)
+		if err != nil {
+			log.Printf("error: %v", err.Error())
+		}
+	}()
+
+	select {
+	case cc := <-certChan:
+		log.Printf("cert file: %s", cc)
+	case <-ctx.Done():
+		log.Printf("context error: %v", ctx.Err())
+	case err := <-errorChan:
+		log.Printf("error: %v", err.Error())
 	}
 }
 
 func main() {
-	ctx := context.Background()
 	log.Println("program is starting")
 	s := &seed{}
 	time.Sleep(500 * time.Millisecond)
@@ -212,20 +227,29 @@ func main() {
 
 	uid7 := s.GetUUIDv7()
 	var key, _ = s.transformToInt(uid7)
-
+	ctx := context.Background()
 	ctx = context.WithValue(ctx, key, sn)
 	log.Println("running goroutines to generate key and cert")
 
-	err := func(ctx context.Context) error {
-		s.contextRun(ctx)
-		return nil
-	}(ctx)
-	if err != nil {
-		panic(err)
-	}
+	errChan := make(chan error, 1)
+	templChan := make(chan x509.Certificate, 1)
 
+	go func(ctx context.Context) {
+		x509t, err := s.GenerateCertTemplate(ctx)
+		if err != nil {
+			errChan <- err
+		}
+		templChan <- *x509t
+	}(ctx)
+	select {
+	case tc := <-templChan:
+		log.Println("generating template for a cert")
+		dispatch(ctx, &tc)
+	case err := <-errChan:
+		log.Printf("error: %v", err.Error())
+	}
 }
 
 var (
-	duration = 500 * time.Millisecond
+	fileMutex sync.Mutex
 )
