@@ -75,10 +75,9 @@ func (s *seed) GetSerialNumber() uint64 {
 }
 
 func (s *seed) GenerateCertTemplate(ctx context.Context) (
-	error,
 	*x509.Certificate,
+	error,
 ) {
-	log.Println("running goroutine to generate cert")
 	sn, ok := ctx.Value(s.Key).(*big.Int)
 	if !ok {
 		log.Fatalf("failed to type assert the variable type: %v", sn)
@@ -87,8 +86,8 @@ func (s *seed) GenerateCertTemplate(ctx context.Context) (
 		SerialNumber: sn,
 		Subject: pkix.Name{
 			CommonName:   "com.apple.idms.appleid.test",
-			Organization: []string{""},
-			Country:      []string{""},
+			Organization: []string{"Pawel Bek"},
+			Country:      []string{"US,EU"},
 		},
 		NotBefore: time.Now(),
 		NotAfter:  time.Now().AddDate(1, 0, 0),
@@ -100,34 +99,26 @@ func (s *seed) GenerateCertTemplate(ctx context.Context) (
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign | x509.KeyUsageKeyEncipherment | x509.KeyUsageKeyAgreement,
 		BasicConstraintsValid: ok,
 		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
-		EmailAddresses:        []string{"", ""},
+		EmailAddresses:        []string{"test@gmail.com"},
+		DNSNames:              []string{"localhost"},
 	}
-	privKey, err := rsa.GenerateKey(rand.Reader, 4096)
-	if err != nil {
-		log.Fatalf("failed to generate private key, error: %v", err)
-	}
-	go generatePrivateKey(ctx, privKey)
 
-	certBytes, err := x509.CreateCertificate(rand.Reader, &x509t, &x509t, &privKey.PublicKey, privKey)
-	if err != nil {
-		log.Fatalf("failed to create cert, error: %v", err)
-	}
-	go generateCert(ctx, certBytes)
-
-	return nil, &x509t
+	return &x509t, nil
 }
 
 func generatePrivateKey(
 	ctx context.Context,
 	pkey *rsa.PrivateKey,
 ) {
+	ctxd, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
 	select {
-	case <-ctx.Done():
-		if err := ctx.Err(); err != nil || errors.Is(err, context.Canceled) {
-			log.Printf("failed to generate key, error: %v", err)
+
+	case <-ctxd.Done():
+		if err := ctx.Err(); errors.Is(err, context.Canceled) {
+			log.Printf("failed to generate private key, error: %v", err)
 		}
 
-	default:
 		pemBytes := pem.EncodeToMemory(&pem.Block{
 			Type:  "RSA PRIVATE KEY",
 			Bytes: x509.MarshalPKCS1PrivateKey(pkey),
@@ -147,20 +138,22 @@ func generatePrivateKey(
 		}
 
 		log.Printf("key generated:\n %s", fmt.Sprint(string(pemBytes)))
+		//default:
 	}
+
 }
 
 func generateCert(
 	ctx context.Context,
 	certBytes []byte,
 ) {
+	ctxe, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
 	select {
-	case <-ctx.Done():
-		if err := ctx.Err(); err != nil || errors.Is(err, context.Canceled) {
+	case <-ctxe.Done():
+		if err := ctx.Err(); errors.Is(err, context.Canceled) {
 			log.Printf("failed to generate cert, error: %v", err)
 		}
-
-	default:
 		pemBytes := pem.EncodeToMemory(&pem.Block{
 			Type:  "CERTIFICATE",
 			Bytes: certBytes,
@@ -181,12 +174,37 @@ func generateCert(
 
 		log.Printf("cert generated:\n %s", fmt.Sprint(string(pemBytes)))
 		os.Exit(0)
+		//default:
+	}
+}
+
+func (s *seed) contextRun(ctx context.Context) {
+	x509t, _ := s.GenerateCertTemplate(ctx)
+	ticker := time.NewTicker(duration)
+	privKey, _ := rsa.GenerateKey(rand.Reader, 4096)
+	certBytes, _ := x509.CreateCertificate(rand.Reader, x509t, x509t, &privKey.PublicKey, privKey)
+
+	ctxa, cancel := context.WithTimeout(ctx, duration)
+	ctxb, _ := context.WithTimeout(ctxa, duration)
+	defer cancel()
+	for {
+		select {
+		case <-ticker.C:
+			go generatePrivateKey(ctx, privKey)
+			<-ctxa.Done()
+			break
+		case <-ctxb.Done():
+			go generateCert(ctx, certBytes)
+			<-ctxa.Done()
+			break
+			//ticker.Stop()
+		default:
+		}
 	}
 }
 
 func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := context.Background()
 	log.Println("program is starting")
 	s := &seed{}
 	time.Sleep(500 * time.Millisecond)
@@ -196,31 +214,18 @@ func main() {
 	var key, _ = s.transformToInt(uid7)
 
 	ctx = context.WithValue(ctx, key, sn)
+	log.Println("running goroutines to generate key and cert")
 
-	go func(ctx context.Context) {
-		for {
-			select {
-			case <-ctx.Done():
-				if err := ctx.Err(); err != nil || errors.Is(err, context.Canceled) {
-					log.Printf("failed to generate cert template, error: %v", err)
-				}
-				log.Println("finished generating cert from template")
-
-			default:
-				if err, _ := s.GenerateCertTemplate(ctx); err != nil {
-					log.Fatalf("failed to generate cert template, error: %v", err)
-				}
-			}
-		}
+	err := func(ctx context.Context) error {
+		s.contextRun(ctx)
+		return nil
 	}(ctx)
-
-	ticker := time.NewTicker(500 * time.Millisecond)
-
-	for {
-		select {
-		case <-ticker.C:
-		case <-ctx.Done():
-		default:
-		}
+	if err != nil {
+		panic(err)
 	}
+
 }
+
+var (
+	duration = 500 * time.Millisecond
+)
