@@ -159,41 +159,51 @@ func generateCert(
 	return string(pemBytes), nil
 }
 
-func dispatch(ctx context.Context, x509t *x509.Certificate) {
+func generateKeyAndCert(ctx context.Context, x509t *x509.Certificate) {
 	privKey, _ := rsa.GenerateKey(rand.Reader, 4096)
 	certBytes, _ := x509.CreateCertificate(rand.Reader, x509t, x509t, &privKey.PublicKey, privKey)
 	privKeyChan := make(chan string, 1)
 	errChan := make(chan error, 1)
-	close(privKeyChan)
-	go func(ctx context.Context) error {
-		log.Println("generating a private key")
-		pkey, _ := generatePrivateKey(ctx, privKey)
-		defer func(ctx context.Context) {
-			if r := recover(); r != nil {
-				err := fmt.Errorf("recovered: %s %s", r.(error).Error(), pkey)
-				errChan <- err
-			}
-		}(ctx)
+	close(privKeyChan) // %CHANNEL%
 
-		select {
-		case <-ctx.Done():
-			log.Printf("private key: %s", pkey)
-			return <-errChan
-		case <-time.After(1 * time.Millisecond):
-			log.Printf("private key: %s", pkey)
-			return <-errChan
-		case privKeyChan <- pkey:
-			log.Printf("private key: %s", pkey)
-			return <-errChan
+	go func() {
+		err := func() error {
+			log.Println("generating a private key")
+			pkey, _ := generatePrivateKey(ctx, privKey)
+			defer func() {
+				if r := recover(); r != nil {
+
+					// if we do not recover this here
+					// closing the channel %CHANNEL% then we won't see one priv key output (perhaps we shouldn't!)
+					err := fmt.Errorf("recovered: %s %s", r.(error).Error(), pkey)
+					err = fmt.Errorf("key pem: %s", pkey)
+					errChan <- err // Here We say LOG IT :)
+				}
+			}()
+
+			select {
+			case <-ctx.Done():
+				log.Printf("key pem: %s", pkey)
+				return <-errChan
+			case <-time.After(1 * time.Millisecond):
+				log.Printf("key pem: %s", pkey)
+				return <-errChan
+			case privKeyChan <- pkey:
+				log.Printf("key pem: %s", pkey)
+				return <-errChan
+			}
+		}() // this Does not matter because of close invoked in line 167
+		if err != nil {
+			panic(err)
 		}
-	}(ctx)
+	}()
 	log.Println(<-errChan)
 
 	certChan := make(chan string, 1)
 	errorChan := make(chan error, 1)
 	go func() {
 		log.Println("generating a cert file")
-		err := func(ctx context.Context) error {
+		err := func() error {
 			cert, err := generateCert(ctx, certBytes)
 			if err != nil {
 
@@ -203,7 +213,7 @@ func dispatch(ctx context.Context, x509t *x509.Certificate) {
 			certChan <- cert
 
 			return nil
-		}(ctx)
+		}()
 		if err != nil {
 			log.Printf("error: %v", err.Error())
 		}
@@ -211,7 +221,7 @@ func dispatch(ctx context.Context, x509t *x509.Certificate) {
 
 	select {
 	case cc := <-certChan:
-		log.Printf("cert file: %s", cc)
+		log.Printf("cert pem: %s", cc)
 	case <-ctx.Done():
 		log.Printf("context error: %v", ctx.Err())
 	case err := <-errorChan:
@@ -244,7 +254,7 @@ func main() {
 	select {
 	case tc := <-templChan:
 		log.Println("generating template for a cert")
-		dispatch(ctx, &tc)
+		generateKeyAndCert(ctx, &tc)
 	case err := <-errChan:
 		log.Printf("error: %v", err.Error())
 	}
